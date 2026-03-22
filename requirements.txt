@@ -1,7 +1,7 @@
 streamlit
 plotly
 PyPDF2
-spacy
+spacy==3.7.2
 scikit-learn
 google-generativeai
 requests
