@@ -2,9 +2,13 @@ import streamlit as st
 import plotly.graph_objects as pgo
 from PyPDF2 import PdfReader
 import spacy
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import spacy
 import re
+try:
+    from sentence_transformers import SentenceTransformer, util
+    HAS_BERT = True
+except ImportError:
+    HAS_BERT = False
 from datetime import datetime
 from collections import Counter
 import math
@@ -32,6 +36,13 @@ st.session_state.gemini_key = st.sidebar.text_input("Gemini API Key (Optional)",
 def load_nlp():
     return spacy.load("en_core_web_sm")
 nlp = load_nlp()
+
+@st.cache_resource
+def load_bert():
+    if HAS_BERT:
+        return SentenceTransformer('all-MiniLM-L6-v2')
+    return None
+bert_model = load_bert()
 
 # ══════════════════════════════════════════════════════════
 # SKILL TAXONOMY
@@ -182,30 +193,23 @@ def normalize(text):
         t = re.sub(pattern, replacement, t)
     return t
 
-def preprocess_for_tfidf(text):
-    text = normalize(text)
-    doc = nlp(text)
-    tokens = [token.lemma_ for token in doc
-              if not token.is_stop and token.is_alpha and len(token) > 2]
-    return " ".join(tokens)
-
-def tfidf_score(resume_raw, jd_raw):
-    resume = preprocess_for_tfidf(resume_raw)
-    jd     = preprocess_for_tfidf(jd_raw)
-    scores = []
-    weights = [0.2, 0.5, 0.3]
-    for ngram in [(1,1),(1,2),(1,3)]:
-        vec = TfidfVectorizer(ngram_range=ngram, min_df=1)
-        try:
-            v = vec.fit_transform([resume, jd])
-            s = cosine_similarity(v[0], v[1])[0][0]
-            scores.append(s)
-        except Exception:
-            pass
-    if not scores:
+def semantic_score(resume_raw, jd_raw):
+    if not HAS_BERT or bert_model is None:
         return 0.0
-    final = sum(s * w for s, w in zip(scores, weights[:len(scores)]))
-    return round(final * 100, 2)
+    try:
+        # MiniLM-L6-v2 is an extremely fast deep-learning BERT model
+        # It calculates true semantic density regardless of phrasing
+        res_emb = bert_model.encode(resume_raw[:5000])
+        jd_emb  = bert_model.encode(jd_raw[:5000])
+        
+        # Compute cosine similarity between the two embeddings
+        cos_score = util.cos_sim(res_emb, jd_emb)[0][0].item()
+        
+        # Map the BERT cosine float (typically ~0.2 to 0.8) to a readable 0-100% scale
+        mapped_score = max(0, min(100, (cos_score - 0.25) * 180))
+        return round(mapped_score, 1)
+    except Exception:
+        return 0.0
 
 def skill_in_text(skill, text_norm):
     if skill in text_norm:
@@ -958,7 +962,7 @@ if go:
             resume_text  = extract_text(resume_file)
             word_count   = len(resume_text.split())
 
-            tfidf_sc                                       = tfidf_score(resume_text, job_desc)
+            tfidf_sc                                       = semantic_score(resume_text, job_desc)
             skill_sc, cat_results, matched, missing, bonus = skill_analysis(resume_text, job_desc)
             sections                                       = detect_sections(resume_text)
             ats_sc, ats_ok, ats_bad                        = ats_score(resume_text, sections)
@@ -999,11 +1003,13 @@ if go:
             gauge_fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=140, paper_bgcolor="rgba(0,0,0,0)")
             
             st.markdown(f'<div class="score-main-card" style="padding:0">', unsafe_allow_html=True)
-            st.plotly_chart(gauge_fig, use_container_width=True, config={'displayModeBar': False})
+            if not HAS_BERT:
+                st.warning("⚠️ Deep AI Engine downloading (PyTorch)... App will hot-reload in 60s.")
+            st.plotly_chart(gauge_fig, config={'displayModeBar': False})
             st.markdown(f'<div class="verdict-badge" style="background:{v_bg};color:{v_color};margin-bottom:12px;">{verdict}</div></div>', unsafe_allow_html=True)
 
         cards = [
-            ("Content Fit",   tfidf_sc,        "TF-IDF similarity",          "📝", "rgba(79,143,255,0.05)"),
+            ("Content Fit",   tfidf_sc,        "Semantic AI Match",          "📝", "rgba(79,143,255,0.05)"),
             ("Skill Match",   round(skill_sc),  f"{len(matched)}/{len(matched)+len(missing)} matched", "🛠", "rgba(0,229,160,0.05)"),
             ("ATS Score",     ats_sc,           "Applicant tracking",         "🤖", "rgba(168,85,247,0.05)"),
             ("Impact Score",  quant_sc,         f"{quant_count} metrics found","📊", "rgba(245,166,35,0.05)"),
